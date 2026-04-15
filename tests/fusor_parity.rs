@@ -219,6 +219,39 @@ fn fusor_gpu_benchmark() {
         );
     }
 
+    // Large-batch sweep to find GPU throughput ceiling for offline chunked processing.
+    eprintln!("\nlarge-batch fused GPU (for offline chunked processing):");
+    for &batch in &[2048usize, 8192, 32768, 131072] {
+        let mut state = fusor_gpu.new_fused_state(batch);
+        let features_batched: Vec<f32> = (0..42 * batch)
+            .map(|i| (i as f32 * 0.0001).sin() * 0.3)
+            .collect();
+        // warmup
+        if let Err(e) =
+            block_on(fusor_gpu.forward_batched_fused(&features_batched, &mut state))
+        {
+            eprintln!("  batch={:>6}  skipped: {e}", batch);
+            continue;
+        }
+
+        let iters = 32usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ =
+                block_on(fusor_gpu.forward_batched_fused(&features_batched, &mut state)).unwrap();
+        }
+        let elapsed = t0.elapsed();
+        let total_frames = iters * batch;
+        let frame_us = elapsed.as_micros() as f64 / total_frames as f64;
+        let call_ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+        // Hours of audio per wall-clock second at this batch:
+        let audio_s_per_wall_s = (total_frames as f64 * 0.010) / elapsed.as_secs_f64();
+        eprintln!(
+            "  batch={:>6}  call={:>6.2} ms  per-frame={:>6.3} us  ({:.0}x realtime)",
+            batch, call_ms, frame_us, audio_s_per_wall_s
+        );
+    }
+
     // Streaming fused sweep at batch=1: how many frames per call amortize the readback?
     eprintln!("\nstreaming fused GPU at batch=1:");
     for &fpc in &[1usize, 2, 4, 8, 16] {
