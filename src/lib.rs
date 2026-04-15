@@ -23,12 +23,16 @@ pub use dasp;
 
 mod denoise;
 mod features;
+#[cfg(feature = "fusor")]
+mod fusor_rnn;
 mod pitch;
 mod rnn;
 
 pub use denoise::DenoiseState;
 pub use features::DenoiseFeatures;
 pub use rnn::RnnModel;
+#[cfg(feature = "fusor")]
+pub use fusor_rnn::{FusorRnnoise, FusorRnnoiseState};
 #[cfg(feature = "dasp")]
 pub use signal::DenoiseSignal;
 
@@ -81,7 +85,9 @@ pub(crate) fn compute_band_corr(out: &mut [f32], x: &[Complex], p: &[Complex]) {
     out[NB_BANDS - 1] *= 2.0;
 }
 
-fn interp_band_gain(out: &mut [f32], band_e: &[f32]) {
+/// Linearly interpolate per-band gains (length [`NB_BANDS`]) onto the linear
+/// frequency grid (length [`FREQ_SIZE`]).
+pub fn interp_band_gain(out: &mut [f32], band_e: &[f32]) {
     for y in out.iter_mut() {
         *y = 0.0;
     }

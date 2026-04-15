@@ -256,11 +256,13 @@ impl DenoiseFeatures {
         self.x *= &*rf;
     }
 
-    pub(crate) fn apply_gain(&mut self, gain: &[f32; FREQ_SIZE]) {
+    /// Multiply the frequency-domain frame by per-bin gains.
+    pub fn apply_gain(&mut self, gain: &[f32; FREQ_SIZE]) {
         self.x *= gain as &[f32];
     }
 
-    pub(crate) fn frame_synthesis(&mut self, out: &mut [f32]) {
+    /// Run the inverse FFT and overlap-add to produce time-domain output samples.
+    pub fn frame_synthesis(&mut self, out: &mut [f32]) {
         self.x.real_ifft_using(&mut self.window_buf);
         // Not too sure why this scaling factor is introduced
         for x in &mut self.window_buf {
