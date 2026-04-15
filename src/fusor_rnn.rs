@@ -656,13 +656,11 @@ impl FusorGru {
         };
 
         // state_new = z * state + (1 - z) * h
-        //           = state + z * (h_neg? ) ... let's do it literally:
-        //   z_state = z * state; one_minus_z_h = (1 - z) * h; state_new = z_state + one_minus_z_h
-        let z_state: Tensor<2, f32> = (&z).mul_(&state);
-        // (1 - z) = -z + 1
-        let one_minus_z: Tensor<2, f32> = ((-&z) + 1.0f32).to_concrete();
-        let one_minus_z_h: Tensor<2, f32> = one_minus_z.mul_(&h);
-        z_state.add_(&one_minus_z_h)
+        //           = (state - h) * z + h
+        // Three kernels (sub, mul, add) instead of five.
+        let diff: Tensor<2, f32> = (&state).sub_(&h);
+        let product: Tensor<2, f32> = diff.mul_(&z);
+        product.add_(&h)
     }
 
     fn finalize_step(&self, state: &mut [f32], in_proj: &[f32], rec_zr: &[f32], rec_h: &[f32]) {
