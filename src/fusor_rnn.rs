@@ -4,7 +4,7 @@
 //! hand-tuned int8 arithmetic. This module mirrors the same network using the [`fusor`] tensor
 //! crate so that it can take advantage of either the CPU or GPU backend that `fusor` exposes.
 
-use fusor::Tensor;
+use fusor::{Device, Tensor};
 
 use crate::rnn::{Activation, DenseLayer, GruLayer, RnnModel};
 
@@ -21,6 +21,7 @@ pub struct FusorRnnoise {
     denoise_gru: FusorGru,
     denoise_output: FusorDense,
     vad_output: FusorDense,
+    device: Device,
 }
 
 /// Mutable hidden state for [`FusorRnnoise`].
@@ -55,16 +56,28 @@ struct FusorGru {
 }
 
 impl FusorRnnoise {
-    /// Create a new `FusorRnnoise` from the default RNNoise weights.
+    /// Create a new `FusorRnnoise` from the default RNNoise weights, running on the CPU.
     pub async fn new() -> fusor::Result<FusorRnnoise> {
+        Self::new_on_device(&Device::Cpu).await
+    }
+
+    /// Create a new `FusorRnnoise` with weights uploaded to the given `fusor` device.
+    ///
+    /// Use `Device::Cpu` for the synchronous path (compatible with [`forward_sync`]), or
+    /// [`fusor::Device::gpu`] for a GPU device (use [`forward`] to read results back).
+    ///
+    /// [`forward_sync`]: FusorRnnoise::forward_sync
+    /// [`forward`]: FusorRnnoise::forward
+    pub async fn new_on_device(device: &Device) -> fusor::Result<FusorRnnoise> {
         let model = RnnModel::default();
         Ok(FusorRnnoise {
-            input_dense: FusorDense::from_layer(&model.input_dense),
-            vad_gru: FusorGru::from_layer(&model.vad_gru),
-            noise_gru: FusorGru::from_layer(&model.noise_gru),
-            denoise_gru: FusorGru::from_layer(&model.denoise_gru),
-            denoise_output: FusorDense::from_layer(&model.denoise_output),
-            vad_output: FusorDense::from_layer(&model.vad_output),
+            input_dense: FusorDense::from_layer(device, &model.input_dense),
+            vad_gru: FusorGru::from_layer(device, &model.vad_gru),
+            noise_gru: FusorGru::from_layer(device, &model.noise_gru),
+            denoise_gru: FusorGru::from_layer(device, &model.denoise_gru),
+            denoise_output: FusorDense::from_layer(device, &model.denoise_output),
+            vad_output: FusorDense::from_layer(device, &model.vad_output),
+            device: device.clone(),
         })
     }
 
@@ -78,38 +91,84 @@ impl FusorRnnoise {
     }
 
     /// Run one frame of inference. Returns the per-band gains and the VAD probability.
+    ///
+    /// Only valid when the model was built on a CPU device (the default). Panics otherwise —
+    /// use [`forward`](Self::forward) for a GPU-capable path.
     pub fn forward_sync(
         &self,
         features: &[f32; 42],
         state: &mut FusorRnnoiseState,
     ) -> (Vec<f32>, f32) {
-        let dense_out = self.input_dense.forward(features);
-        self.vad_gru.step(&mut state.vad, &dense_out);
-        let vad = self.vad_output.forward(&state.vad);
+        assert!(
+            self.device.is_cpu(),
+            "FusorRnnoise::forward_sync requires a CPU device; call forward() on GPU"
+        );
+        let device = &self.device;
+        let dense_out = self.input_dense.forward(device, features);
+        self.vad_gru.step(device, &mut state.vad, &dense_out);
+        let vad = self.vad_output.forward(device, &state.vad);
 
         let mut noise_input = Vec::with_capacity(dense_out.len() + state.vad.len() + 42);
         noise_input.extend_from_slice(&dense_out);
         noise_input.extend_from_slice(&state.vad);
         noise_input.extend_from_slice(features);
-        self.noise_gru.step(&mut state.noise, &noise_input);
+        self.noise_gru.step(device, &mut state.noise, &noise_input);
 
         let mut denoise_input = Vec::with_capacity(state.vad.len() + state.noise.len() + 42);
         denoise_input.extend_from_slice(&state.vad);
         denoise_input.extend_from_slice(&state.noise);
         denoise_input.extend_from_slice(features);
-        self.denoise_gru.step(&mut state.denoise, &denoise_input);
+        self.denoise_gru
+            .step(device, &mut state.denoise, &denoise_input);
 
-        let gains = self.denoise_output.forward(&state.denoise);
+        let gains = self.denoise_output.forward(device, &state.denoise);
         (gains, vad[0])
+    }
+
+    /// Run one frame of inference on whichever device this model lives on. Works on both CPU and
+    /// GPU, but requires `.await` because GPU readback is asynchronous.
+    pub async fn forward(
+        &self,
+        features: &[f32; 42],
+        state: &mut FusorRnnoiseState,
+    ) -> fusor::Result<(Vec<f32>, f32)> {
+        let device = &self.device;
+        let dense_out = self.input_dense.forward_async(device, features).await?;
+        self.vad_gru
+            .step_async(device, &mut state.vad, &dense_out)
+            .await?;
+        let vad = self.vad_output.forward_async(device, &state.vad).await?;
+
+        let mut noise_input = Vec::with_capacity(dense_out.len() + state.vad.len() + 42);
+        noise_input.extend_from_slice(&dense_out);
+        noise_input.extend_from_slice(&state.vad);
+        noise_input.extend_from_slice(features);
+        self.noise_gru
+            .step_async(device, &mut state.noise, &noise_input)
+            .await?;
+
+        let mut denoise_input = Vec::with_capacity(state.vad.len() + state.noise.len() + 42);
+        denoise_input.extend_from_slice(&state.vad);
+        denoise_input.extend_from_slice(&state.noise);
+        denoise_input.extend_from_slice(features);
+        self.denoise_gru
+            .step_async(device, &mut state.denoise, &denoise_input)
+            .await?;
+
+        let gains = self
+            .denoise_output
+            .forward_async(device, &state.denoise)
+            .await?;
+        Ok((gains, vad[0]))
     }
 }
 
 impl FusorDense {
-    fn from_layer(layer: &DenseLayer) -> Self {
+    fn from_layer(device: &Device, layer: &DenseLayer) -> Self {
         let weight = transpose_dense_weights(&layer.input_weights, layer.nb_inputs, layer.nb_neurons);
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
         FusorDense {
-            weight: Tensor::Cpu(fusor::CpuTensor::from_slice([layer.nb_neurons, layer.nb_inputs], &weight)),
+            weight: Tensor::from_slice(device, [layer.nb_neurons, layer.nb_inputs], &weight),
             bias,
             activation: layer.activation,
             n_in: layer.nb_inputs,
@@ -117,30 +176,40 @@ impl FusorDense {
         }
     }
 
-    fn forward(&self, input: &[f32]) -> Vec<f32> {
+    fn forward(&self, device: &Device, input: &[f32]) -> Vec<f32> {
         debug_assert_eq!(input.len(), self.n_in);
-        let input_tensor: Tensor<2, f32> =
-            Tensor::Cpu(fusor::CpuTensor::from_slice([self.n_in, 1], input));
-        let mut out = matvec(&self.weight, &input_tensor, self.n_out);
+        let input_tensor: Tensor<2, f32> = Tensor::from_slice(device, [self.n_in, 1], input);
+        let mut out = matvec_sync(&self.weight, &input_tensor, self.n_out);
         for (out, &b) in out.iter_mut().zip(self.bias.iter()) {
             *out += b;
         }
         apply_activation(&mut out, self.activation);
         out
     }
+
+    async fn forward_async(&self, device: &Device, input: &[f32]) -> fusor::Result<Vec<f32>> {
+        debug_assert_eq!(input.len(), self.n_in);
+        let input_tensor: Tensor<2, f32> = Tensor::from_slice(device, [self.n_in, 1], input);
+        let mut out = matvec_async(&self.weight, &input_tensor, self.n_out).await?;
+        for (out, &b) in out.iter_mut().zip(self.bias.iter()) {
+            *out += b;
+        }
+        apply_activation(&mut out, self.activation);
+        Ok(out)
+    }
 }
 
 impl FusorGru {
-    fn from_layer(layer: &GruLayer) -> Self {
+    fn from_layer(device: &Device, layer: &GruLayer) -> Self {
         let n = layer.nb_neurons;
         let in_w = transpose_gru_weights(&layer.input_weights, layer.nb_inputs, n);
         let rec_w_zr = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 0..2 * n);
         let rec_w_h = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 2 * n..3 * n);
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
         FusorGru {
-            w_in: Tensor::Cpu(fusor::CpuTensor::from_slice([3 * n, layer.nb_inputs], &in_w)),
-            w_rec_zr: Tensor::Cpu(fusor::CpuTensor::from_slice([2 * n, n], &rec_w_zr)),
-            w_rec_h: Tensor::Cpu(fusor::CpuTensor::from_slice([n, n], &rec_w_h)),
+            w_in: Tensor::from_slice(device, [3 * n, layer.nb_inputs], &in_w),
+            w_rec_zr: Tensor::from_slice(device, [2 * n, n], &rec_w_zr),
+            w_rec_h: Tensor::from_slice(device, [n, n], &rec_w_h),
             bias,
             activation: layer.activation,
             n_in: layer.nb_inputs,
@@ -148,27 +217,57 @@ impl FusorGru {
         }
     }
 
-    fn step(&self, state: &mut [f32], input: &[f32]) {
+    fn step(&self, device: &Device, state: &mut [f32], input: &[f32]) {
         debug_assert_eq!(input.len(), self.n_in);
         debug_assert_eq!(state.len(), self.n_out);
         let n = self.n_out;
 
-        let input_tensor: Tensor<2, f32> =
-            Tensor::Cpu(fusor::CpuTensor::from_slice([self.n_in, 1], input));
-        let state_tensor: Tensor<2, f32> = Tensor::Cpu(fusor::CpuTensor::from_slice([n, 1], state));
+        let input_tensor: Tensor<2, f32> = Tensor::from_slice(device, [self.n_in, 1], input);
+        let state_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, 1], state);
 
-        let in_proj = matvec(&self.w_in, &input_tensor, 3 * n);
-        let rec_zr = matvec(&self.w_rec_zr, &state_tensor, 2 * n);
+        let in_proj = matvec_sync(&self.w_in, &input_tensor, 3 * n);
+        let rec_zr = matvec_sync(&self.w_rec_zr, &state_tensor, 2 * n);
 
         // Reset gate gates the state, then a second recurrent matmul produces h's recurrent term.
         let mut gated_reset = vec![0.0f32; n];
         for j in 0..n {
             gated_reset[j] = state[j] * sigmoid(self.bias[n + j] + in_proj[n + j] + rec_zr[n + j]);
         }
-        let gated_tensor: Tensor<2, f32> =
-            Tensor::Cpu(fusor::CpuTensor::from_slice([n, 1], &gated_reset));
-        let rec_h = matvec(&self.w_rec_h, &gated_tensor, n);
+        let gated_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, 1], &gated_reset);
+        let rec_h = matvec_sync(&self.w_rec_h, &gated_tensor, n);
 
+        self.finalize_step(state, &in_proj, &rec_zr, &rec_h);
+    }
+
+    async fn step_async(
+        &self,
+        device: &Device,
+        state: &mut [f32],
+        input: &[f32],
+    ) -> fusor::Result<()> {
+        debug_assert_eq!(input.len(), self.n_in);
+        debug_assert_eq!(state.len(), self.n_out);
+        let n = self.n_out;
+
+        let input_tensor: Tensor<2, f32> = Tensor::from_slice(device, [self.n_in, 1], input);
+        let state_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, 1], state);
+
+        let in_proj = matvec_async(&self.w_in, &input_tensor, 3 * n).await?;
+        let rec_zr = matvec_async(&self.w_rec_zr, &state_tensor, 2 * n).await?;
+
+        let mut gated_reset = vec![0.0f32; n];
+        for j in 0..n {
+            gated_reset[j] = state[j] * sigmoid(self.bias[n + j] + in_proj[n + j] + rec_zr[n + j]);
+        }
+        let gated_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, 1], &gated_reset);
+        let rec_h = matvec_async(&self.w_rec_h, &gated_tensor, n).await?;
+
+        self.finalize_step(state, &in_proj, &rec_zr, &rec_h);
+        Ok(())
+    }
+
+    fn finalize_step(&self, state: &mut [f32], in_proj: &[f32], rec_zr: &[f32], rec_h: &[f32]) {
+        let n = self.n_out;
         for j in 0..n {
             let z = sigmoid(self.bias[j] + in_proj[j] + rec_zr[j]);
             let pre = self.bias[2 * n + j] + in_proj[2 * n + j] + rec_h[j];
@@ -234,16 +333,30 @@ fn transpose_gru_weights(data: &[i8], n_in: usize, n_out: usize) -> Vec<f32> {
     out
 }
 
-fn matvec(weight: &Tensor<2, f32>, input_2d: &Tensor<2, f32>, n_out: usize) -> Vec<f32> {
+fn matvec_sync(weight: &Tensor<2, f32>, input_2d: &Tensor<2, f32>, n_out: usize) -> Vec<f32> {
     let result = weight.matmul(input_2d);
     let cpu = match result {
         Tensor::Cpu(t) => t,
-        _ => panic!("FusorRnnoise expects CPU tensors"),
+        _ => panic!("forward_sync requires CPU tensors"),
     };
     let slice = cpu.as_slice();
     let raw = slice.as_slice();
     debug_assert_eq!(raw.len(), n_out);
     raw.to_vec()
+}
+
+async fn matvec_async(
+    weight: &Tensor<2, f32>,
+    input_2d: &Tensor<2, f32>,
+    n_out: usize,
+) -> fusor::Result<Vec<f32>> {
+    let result = weight.matmul(input_2d);
+    let slice = result.as_slice().await?;
+    let mut out = vec![0.0f32; n_out];
+    for j in 0..n_out {
+        out[j] = slice[[j, 0]];
+    }
+    Ok(out)
 }
 
 fn sigmoid(x: f32) -> f32 {
