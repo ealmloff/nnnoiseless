@@ -170,14 +170,13 @@ fn fusor_gpu_benchmark() {
         fusor_gpu_elapsed.as_secs_f64() / fusor_cpu_elapsed.as_secs_f64(),
     );
 
-    // Batched GPU sweep.
-    eprintln!("\nbatched GPU (frames/sec across {} frames per batch):", n);
+    // Batched GPU sweep (non-fused: 12 readbacks per call).
+    eprintln!("\nbatched GPU — non-fused (12 readbacks/call):");
     for &batch in &[1usize, 8, 32, 128, 512, 2048] {
         let mut state = fusor_gpu.new_batched_state(batch);
         let features_batched: Vec<f32> = (0..42 * batch)
             .map(|i| (i as f32 * 0.01).sin() * 0.3)
             .collect();
-        // warmup
         let _ = block_on(fusor_gpu.forward_batched(&features_batched, &mut state)).unwrap();
 
         let iters = 200usize.max(n / batch.max(1));
@@ -194,4 +193,58 @@ fn fusor_gpu_benchmark() {
             batch, call_us, frame_us, iters, total_frames
         );
     }
+
+    // Fused GPU sweep: state persists on the GPU, only 2 readbacks per call.
+    eprintln!("\nbatched GPU — fused (state GPU-resident, 2 readbacks/call):");
+    for &batch in &[1usize, 8, 32, 128, 512, 2048] {
+        let mut state = fusor_gpu.new_fused_state(batch);
+        let features_batched: Vec<f32> = (0..42 * batch)
+            .map(|i| (i as f32 * 0.01).sin() * 0.3)
+            .collect();
+        let _ = block_on(fusor_gpu.forward_batched_fused(&features_batched, &mut state)).unwrap();
+
+        let iters = 200usize.max(n / batch.max(1));
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ =
+                block_on(fusor_gpu.forward_batched_fused(&features_batched, &mut state)).unwrap();
+        }
+        let elapsed = t0.elapsed();
+        let total_frames = iters * batch;
+        let frame_us = elapsed.as_micros() as f64 / total_frames as f64;
+        let call_us = elapsed.as_micros() as f64 / iters as f64;
+        eprintln!(
+            "  batch={:>4}  call={:>9.2} us  per-frame={:>8.3} us  ({} iters, {} total frames)",
+            batch, call_us, frame_us, iters, total_frames
+        );
+    }
+
+    // Parity check for the fused path vs the reference CPU rnnoise.
+    let mut cpu_state = RnnState::new(Cow::Owned(RnnModel::default()));
+    let mut fused_state = fusor_gpu.new_fused_state(1);
+    let mut max_gain_diff = 0.0f32;
+    let mut max_vad_diff = 0.0f32;
+    for step in 0..32 {
+        let features: [f32; 42] =
+            std::array::from_fn(|i| (step as f32 * 0.13 + i as f32 * 0.27).sin() * 0.4);
+        let mut cpu_gains = [0.0f32; 22];
+        let mut cpu_vad = [0.0f32; 1];
+        cpu_state.compute(&mut cpu_gains, &mut cpu_vad, &features);
+
+        let (gains, vad) =
+            block_on(fusor_gpu.forward_batched_fused(&features, &mut fused_state)).unwrap();
+        for (a, b) in cpu_gains.iter().zip(gains.iter()) {
+            max_gain_diff = max_gain_diff.max((a - b).abs());
+        }
+        max_vad_diff = max_vad_diff.max((cpu_vad[0] - vad[0]).abs());
+    }
+    eprintln!("fused GPU max gain diff = {max_gain_diff}, max vad diff = {max_vad_diff}");
+    assert!(
+        max_gain_diff < 0.05,
+        "fused GPU gain diff too large: {max_gain_diff}"
+    );
+    assert!(
+        max_vad_diff < 0.05,
+        "fused GPU vad diff too large: {max_vad_diff}"
+    );
 }

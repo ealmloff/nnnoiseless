@@ -42,9 +42,23 @@ pub struct FusorBatchedState {
     denoise: Vec<f32>,
 }
 
+/// GPU-resident hidden state for the fused batched path
+/// ([`FusorRnnoise::forward_batched_fused`]).
+///
+/// Unlike [`FusorBatchedState`], this keeps the GRU state as tensors on whichever device the
+/// model lives on, so consecutive frames don't round-trip through the CPU.
+pub struct FusorFusedState {
+    batch: usize,
+    vad: Tensor<2, f32>,
+    noise: Tensor<2, f32>,
+    denoise: Tensor<2, f32>,
+}
+
 struct FusorDense {
     weight: Tensor<2, f32>,
     bias: Vec<f32>,
+    /// Bias as a 1-D tensor for the GPU-resident fused path.
+    bias_t: Tensor<1, f32>,
     activation: Activation,
     n_in: usize,
     n_out: usize,
@@ -61,6 +75,10 @@ struct FusorGru {
     w_rec_h: Tensor<2, f32>,
     /// Concatenated biases [z | r | h], shape `[3 * n_out]`.
     bias: Vec<f32>,
+    /// Per-gate biases as 1-D tensors for the GPU-resident fused path.
+    bias_z: Tensor<1, f32>,
+    bias_r: Tensor<1, f32>,
+    bias_h: Tensor<1, f32>,
     activation: Activation,
     n_in: usize,
     n_out: usize,
@@ -108,6 +126,29 @@ impl FusorRnnoise {
             vad: vec![0.0; batch * self.vad_gru.n_out],
             noise: vec![0.0; batch * self.noise_gru.n_out],
             denoise: vec![0.0; batch * self.denoise_gru.n_out],
+        }
+    }
+
+    /// Build a GPU-resident batched hidden state for the fused path.
+    pub fn new_fused_state(&self, batch: usize) -> FusorFusedState {
+        let d = &self.device;
+        FusorFusedState {
+            batch,
+            vad: Tensor::from_slice(
+                d,
+                [self.vad_gru.n_out, batch],
+                &vec![0.0f32; self.vad_gru.n_out * batch],
+            ),
+            noise: Tensor::from_slice(
+                d,
+                [self.noise_gru.n_out, batch],
+                &vec![0.0f32; self.noise_gru.n_out * batch],
+            ),
+            denoise: Tensor::from_slice(
+                d,
+                [self.denoise_gru.n_out, batch],
+                &vec![0.0f32; self.denoise_gru.n_out * batch],
+            ),
         }
     }
 
@@ -160,6 +201,61 @@ impl FusorRnnoise {
             .denoise_output
             .forward_batched_async(device, &state.denoise, batch)
             .await?;
+        Ok((gains, vad))
+    }
+
+    /// Fused batched forward: keeps the hidden state on the GPU across calls so that the *only*
+    /// CPU round-trips per frame are (a) uploading `features` and (b) reading back `gains` + `vad`
+    /// at the end. Returns `(gains [22 * batch], vad [batch])` laid out the same way as
+    /// [`forward_batched`](Self::forward_batched).
+    pub async fn forward_batched_fused(
+        &self,
+        features: &[f32],
+        state: &mut FusorFusedState,
+    ) -> fusor::Result<(Vec<f32>, Vec<f32>)> {
+        let batch = state.batch;
+        debug_assert_eq!(features.len(), batch * 42);
+        let device = &self.device;
+
+        // Upload features as [42, batch].
+        let features_t: Tensor<2, f32> = Tensor::from_slice(device, [42, batch], features);
+
+        // input_dense: [24, batch]
+        let dense_out = self.input_dense.forward_batched_fused(&features_t);
+
+        // vad GRU: state updated in-place on GPU.
+        let vad_prev = std::mem::replace(&mut state.vad, Tensor::<2, f32>::zeros(device, [1, batch]));
+        state.vad = self.vad_gru.step_batched_fused(vad_prev, &dense_out);
+
+        // vad output: [1, batch]
+        let vad_t = self.vad_output.forward_batched_fused(&state.vad);
+
+        // Concatenate [dense_out, state.vad, features_t] along dim 0 — fusor exposes `cat`.
+        let noise_input = fusor::cat(
+            [dense_out.clone(), state.vad.clone(), features_t.clone()],
+            0,
+        );
+        let noise_prev = std::mem::replace(&mut state.noise, Tensor::<2, f32>::zeros(device, [1, batch]));
+        state.noise = self.noise_gru.step_batched_fused(noise_prev, &noise_input);
+
+        let denoise_input = fusor::cat(
+            [state.vad.clone(), state.noise.clone(), features_t.clone()],
+            0,
+        );
+        let denoise_prev =
+            std::mem::replace(&mut state.denoise, Tensor::<2, f32>::zeros(device, [1, batch]));
+        state.denoise = self
+            .denoise_gru
+            .step_batched_fused(denoise_prev, &denoise_input);
+
+        // denoise output: [22, batch]
+        let gains_t = self.denoise_output.forward_batched_fused(&state.denoise);
+
+        // Single readback for both outputs.
+        let gains_slice = gains_t.as_slice().await?;
+        let gains = gains_slice.as_slice().to_vec();
+        let vad_slice = vad_t.as_slice().await?;
+        let vad = vad_slice.as_slice().to_vec();
         Ok((gains, vad))
     }
 
@@ -240,9 +336,11 @@ impl FusorDense {
     fn from_layer(device: &Device, layer: &DenseLayer) -> Self {
         let weight = transpose_dense_weights(&layer.input_weights, layer.nb_inputs, layer.nb_neurons);
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
+        let bias_t = Tensor::from_slice(device, [layer.nb_neurons], &bias);
         FusorDense {
             weight: Tensor::from_slice(device, [layer.nb_neurons, layer.nb_inputs], &weight),
             bias,
+            bias_t,
             activation: layer.activation,
             n_in: layer.nb_inputs,
             n_out: layer.nb_neurons,
@@ -290,6 +388,16 @@ impl FusorDense {
         apply_activation(&mut out, self.activation);
         Ok(out)
     }
+
+    /// Fused GPU forward: no CPU round-trip. Returns `[n_out, batch]`.
+    fn forward_batched_fused(&self, input: &Tensor<2, f32>) -> Tensor<2, f32> {
+        let batch = input.shape()[1];
+        let pre = self
+            .weight
+            .matmul(input)
+            .add_(&self.bias_t.broadcast_as([self.n_out, batch]));
+        apply_activation_tensor(pre, self.activation)
+    }
 }
 
 impl FusorGru {
@@ -299,11 +407,17 @@ impl FusorGru {
         let rec_w_zr = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 0..2 * n);
         let rec_w_h = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 2 * n..3 * n);
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
+        let bias_z = Tensor::from_slice(device, [n], &bias[0..n]);
+        let bias_r = Tensor::from_slice(device, [n], &bias[n..2 * n]);
+        let bias_h = Tensor::from_slice(device, [n], &bias[2 * n..3 * n]);
         FusorGru {
             w_in: Tensor::from_slice(device, [3 * n, layer.nb_inputs], &in_w),
             w_rec_zr: Tensor::from_slice(device, [2 * n, n], &rec_w_zr),
             w_rec_h: Tensor::from_slice(device, [n, n], &rec_w_h),
             bias,
+            bias_z,
+            bias_r,
+            bias_h,
             activation: layer.activation,
             n_in: layer.nb_inputs,
             n_out: n,
@@ -416,6 +530,60 @@ impl FusorGru {
                 state[idx] = z * state[idx] + (1.0 - z) * h;
             }
         }
+    }
+
+    /// Fully fused GRU step on whatever device `state` / `input` live on. Takes `state` by value
+    /// and returns the next state — no intermediate CPU round-trips.
+    fn step_batched_fused(&self, state: Tensor<2, f32>, input: &Tensor<2, f32>) -> Tensor<2, f32> {
+        let n = self.n_out;
+        let batch = state.shape()[1];
+
+        // [3n, batch] and [2n, batch]
+        let in_proj = self.w_in.matmul(input);
+        let rec_zr = self.w_rec_zr.matmul(&state);
+
+        // Slice per-gate views.
+        let in_z = in_proj.narrow(0, 0, n);
+        let in_r = in_proj.narrow(0, n, n);
+        let in_h = in_proj.narrow(0, 2 * n, n);
+        let rec_z = rec_zr.narrow(0, 0, n);
+        let rec_r = rec_zr.narrow(0, n, n);
+
+        let bias_z = self.bias_z.broadcast_as([n, batch]);
+        let bias_r = self.bias_r.broadcast_as([n, batch]);
+        let bias_h = self.bias_h.broadcast_as([n, batch]);
+
+        // z = sigmoid(bias_z + in_z + rec_z)
+        let z_pre: Tensor<2, f32> = bias_z.add_(&in_z);
+        let z_pre: Tensor<2, f32> = z_pre.add_(&rec_z);
+        let z = sigmoid_tensor(&z_pre);
+
+        // r = sigmoid(bias_r + in_r + rec_r)
+        let r_pre: Tensor<2, f32> = bias_r.add_(&in_r);
+        let r_pre: Tensor<2, f32> = r_pre.add_(&rec_r);
+        let r = sigmoid_tensor(&r_pre);
+
+        // gated_reset = state * r
+        let gated_reset: Tensor<2, f32> = (&state).mul_(&r);
+        let rec_h = self.w_rec_h.matmul(&gated_reset);
+
+        // h_pre = bias_h + in_h + rec_h
+        let h_pre: Tensor<2, f32> = bias_h.add_(&in_h);
+        let h_pre: Tensor<2, f32> = h_pre.add_(&rec_h);
+        let h = match self.activation {
+            Activation::Sigmoid => sigmoid_tensor(&h_pre),
+            Activation::Tanh => h_pre.tanh().to_concrete(),
+            Activation::Relu => h_pre.relu(),
+        };
+
+        // state_new = z * state + (1 - z) * h
+        //           = state + z * (h_neg? ) ... let's do it literally:
+        //   z_state = z * state; one_minus_z_h = (1 - z) * h; state_new = z_state + one_minus_z_h
+        let z_state: Tensor<2, f32> = (&z).mul_(&state);
+        // (1 - z) = -z + 1
+        let one_minus_z: Tensor<2, f32> = ((-&z) + 1.0f32).to_concrete();
+        let one_minus_z_h: Tensor<2, f32> = one_minus_z.mul_(&h);
+        z_state.add_(&one_minus_z_h)
     }
 
     fn finalize_step(&self, state: &mut [f32], in_proj: &[f32], rec_zr: &[f32], rec_h: &[f32]) {
@@ -550,6 +718,23 @@ fn concat_rows(dst: &mut [f32], a: &[f32], b: &[f32], c: &[f32], batch: usize) {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Element-wise activation applied to a rank-2 tensor. Sigmoid is computed as
+/// `(tanh(x/2) + 1) / 2` to avoid needing a `1 / tensor` op.
+fn apply_activation_tensor(t: Tensor<2, f32>, activation: Activation) -> Tensor<2, f32> {
+    match activation {
+        Activation::Sigmoid => sigmoid_tensor(&t),
+        Activation::Tanh => t.tanh().to_concrete(),
+        Activation::Relu => t.relu(),
+    }
+}
+
+/// `sigmoid(x) = (tanh(x / 2) + 1) / 2`.
+fn sigmoid_tensor(t: &Tensor<2, f32>) -> Tensor<2, f32> {
+    let half: Tensor<2, f32> = (t * 0.5f32).to_concrete();
+    let tanh_half: Tensor<2, f32> = half.tanh().to_concrete();
+    ((tanh_half + 1.0f32) * 0.5f32).to_concrete()
 }
 
 fn apply_activation(values: &mut [f32], activation: Activation) {
