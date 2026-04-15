@@ -219,6 +219,33 @@ fn fusor_gpu_benchmark() {
         );
     }
 
+    // Streaming fused sweep at batch=1: how many frames per call amortize the readback?
+    eprintln!("\nstreaming fused GPU at batch=1:");
+    for &fpc in &[1usize, 2, 4, 8, 16] {
+        let mut state = fusor_gpu.new_fused_state(1);
+        let features_stream: Vec<f32> = (0..42 * fpc).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let _ = block_on(fusor_gpu.forward_batched_fused_many(&features_stream, fpc, &mut state)).unwrap();
+
+        let iters = 64usize.max(256 / fpc.max(1));
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = block_on(fusor_gpu.forward_batched_fused_many(
+                &features_stream,
+                fpc,
+                &mut state,
+            ))
+            .unwrap();
+        }
+        let elapsed = t0.elapsed();
+        let total_frames = iters * fpc;
+        let frame_us = elapsed.as_micros() as f64 / total_frames as f64;
+        let call_us = elapsed.as_micros() as f64 / iters as f64;
+        eprintln!(
+            "  frames_per_call={:>4}  call={:>9.2} us  per-frame={:>8.3} us  ({} iters)",
+            fpc, call_us, frame_us, iters
+        );
+    }
+
     // Parity check for the fused path vs the reference CPU rnnoise.
     let mut cpu_state = RnnState::new(Cow::Owned(RnnModel::default()));
     let mut fused_state = fusor_gpu.new_fused_state(1);

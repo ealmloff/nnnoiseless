@@ -262,6 +262,82 @@ impl FusorRnnoise {
         Ok((gains, vad))
     }
 
+    /// Process `frame_count` back-to-back frames with a single final readback, amortizing the
+    /// map_async roundtrip (~4–6 ms on Metal) across all the frames in the call. The recurrent
+    /// state is threaded through each frame on the GPU; the CPU never sees intermediate values.
+    ///
+    /// `features` has length `frame_count * 42 * batch`, laid out frame-major: the i-th frame's
+    /// feature vector lives at `features[i * 42 * batch .. (i + 1) * 42 * batch]`.
+    ///
+    /// Returns `(gains, vad)` where `gains.len() == frame_count * 22 * batch` and
+    /// `vad.len() == frame_count * batch` — frame i's outputs occupy the i-th block.
+    pub async fn forward_batched_fused_many(
+        &self,
+        features: &[f32],
+        frame_count: usize,
+        state: &mut FusorFusedState,
+    ) -> fusor::Result<(Vec<f32>, Vec<f32>)> {
+        let batch = state.batch;
+        debug_assert_eq!(features.len(), frame_count * 42 * batch);
+        let device = &self.device;
+        let frame_feat_len = 42 * batch;
+
+        let mut per_frame_out: Vec<Tensor<2, f32>> = Vec::with_capacity(frame_count);
+
+        for i in 0..frame_count {
+            let frame = &features[i * frame_feat_len..(i + 1) * frame_feat_len];
+            let features_t: Tensor<2, f32> = Tensor::from_slice(device, [42, batch], frame);
+
+            let dense_out = self.input_dense.forward_batched_fused(&features_t);
+
+            let vad_prev = std::mem::replace(&mut state.vad, Tensor::<2, f32>::zeros(device, [1, batch]));
+            state.vad = self.vad_gru.step_batched_fused(vad_prev, &dense_out);
+
+            let vad_t = self.vad_output.forward_batched_fused(&state.vad);
+
+            let noise_input = fusor::cat(
+                [dense_out.clone(), state.vad.clone(), features_t.clone()],
+                0,
+            );
+            let noise_prev =
+                std::mem::replace(&mut state.noise, Tensor::<2, f32>::zeros(device, [1, batch]));
+            state.noise = self.noise_gru.step_batched_fused(noise_prev, &noise_input);
+
+            let denoise_input = fusor::cat(
+                [state.vad.clone(), state.noise.clone(), features_t.clone()],
+                0,
+            );
+            let denoise_prev = std::mem::replace(
+                &mut state.denoise,
+                Tensor::<2, f32>::zeros(device, [1, batch]),
+            );
+            state.denoise = self
+                .denoise_gru
+                .step_batched_fused(denoise_prev, &denoise_input);
+
+            let gains_t = self.denoise_output.forward_batched_fused(&state.denoise);
+
+            // Combine this frame's [vad (1 row), gains (22 rows)] into a [23, batch] tensor.
+            per_frame_out.push(fusor::cat([vad_t, gains_t], 0));
+        }
+
+        // Stack all frames along dim 0: final shape [frame_count * 23, batch]. One readback.
+        let combined = fusor::cat(per_frame_out, 0);
+        let combined_slice = combined.as_slice().await?;
+        let raw = combined_slice.as_slice();
+        debug_assert_eq!(raw.len(), frame_count * 23 * batch);
+
+        let mut gains = vec![0.0f32; frame_count * 22 * batch];
+        let mut vad = vec![0.0f32; frame_count * batch];
+        for i in 0..frame_count {
+            let base = i * 23 * batch;
+            vad[i * batch..(i + 1) * batch].copy_from_slice(&raw[base..base + batch]);
+            gains[i * 22 * batch..(i + 1) * 22 * batch]
+                .copy_from_slice(&raw[base + batch..base + 23 * batch]);
+        }
+        Ok((gains, vad))
+    }
+
     /// Run one frame of inference. Returns the per-band gains and the VAD probability.
     ///
     /// Only valid when the model was built on a CPU device (the default). Panics otherwise —
