@@ -251,11 +251,14 @@ impl FusorRnnoise {
         // denoise output: [22, batch]
         let gains_t = self.denoise_output.forward_batched_fused(&state.denoise);
 
-        // Single readback for both outputs.
-        let gains_slice = gains_t.as_slice().await?;
-        let gains = gains_slice.as_slice().to_vec();
-        let vad_slice = vad_t.as_slice().await?;
-        let vad = vad_slice.as_slice().to_vec();
+        // Concatenate vad (1 row) and gains (22 rows) into a single [23, batch] tensor so
+        // the frame finishes with ONE map_async round-trip instead of two.
+        let combined = fusor::cat([vad_t, gains_t], 0);
+        let combined_slice = combined.as_slice().await?;
+        let raw = combined_slice.as_slice();
+        debug_assert_eq!(raw.len(), 23 * batch);
+        let vad = raw[..batch].to_vec();
+        let gains = raw[batch..].to_vec();
         Ok((gains, vad))
     }
 
