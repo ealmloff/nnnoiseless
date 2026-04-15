@@ -31,6 +31,17 @@ pub struct FusorRnnoiseState {
     denoise: Vec<f32>,
 }
 
+/// Mutable hidden state for batched inference via [`FusorRnnoise::forward_batched`].
+///
+/// Each of the GRU state buffers holds `batch * n_out` elements, with element at
+/// `j * batch + b` corresponding to neuron `j` of batch `b`.
+pub struct FusorBatchedState {
+    batch: usize,
+    vad: Vec<f32>,
+    noise: Vec<f32>,
+    denoise: Vec<f32>,
+}
+
 struct FusorDense {
     weight: Tensor<2, f32>,
     bias: Vec<f32>,
@@ -88,6 +99,68 @@ impl FusorRnnoise {
             noise: vec![0.0; self.noise_gru.n_out],
             denoise: vec![0.0; self.denoise_gru.n_out],
         }
+    }
+
+    /// Build a batched hidden state for running `batch` independent streams together.
+    pub fn new_batched_state(&self, batch: usize) -> FusorBatchedState {
+        FusorBatchedState {
+            batch,
+            vad: vec![0.0; batch * self.vad_gru.n_out],
+            noise: vec![0.0; batch * self.noise_gru.n_out],
+            denoise: vec![0.0; batch * self.denoise_gru.n_out],
+        }
+    }
+
+    /// Run one frame of inference across a batch of `batch` independent streams.
+    ///
+    /// `features` must have length `batch * 42`, laid out so that `features[j * batch + b]` is
+    /// feature index `j` of batch `b`. The returned `gains` are laid out similarly with length
+    /// `batch * 22`; the returned `vad` has length `batch`.
+    pub async fn forward_batched(
+        &self,
+        features: &[f32],
+        state: &mut FusorBatchedState,
+    ) -> fusor::Result<(Vec<f32>, Vec<f32>)> {
+        let batch = state.batch;
+        debug_assert_eq!(features.len(), batch * 42);
+        let device = &self.device;
+
+        let dense_out = self
+            .input_dense
+            .forward_batched_async(device, features, batch)
+            .await?;
+        self.vad_gru
+            .step_batched_async(device, &mut state.vad, &dense_out, batch)
+            .await?;
+        let vad = self
+            .vad_output
+            .forward_batched_async(device, &state.vad, batch)
+            .await?;
+
+        let mut noise_input = vec![0.0f32; (dense_out.len() + state.vad.len() + 42 * batch)];
+        concat_rows(&mut noise_input, &dense_out, &state.vad, features, batch);
+        self.noise_gru
+            .step_batched_async(device, &mut state.noise, &noise_input, batch)
+            .await?;
+
+        let mut denoise_input =
+            vec![0.0f32; (state.vad.len() + state.noise.len() + 42 * batch)];
+        concat_rows(
+            &mut denoise_input,
+            &state.vad,
+            &state.noise,
+            features,
+            batch,
+        );
+        self.denoise_gru
+            .step_batched_async(device, &mut state.denoise, &denoise_input, batch)
+            .await?;
+
+        let gains = self
+            .denoise_output
+            .forward_batched_async(device, &state.denoise, batch)
+            .await?;
+        Ok((gains, vad))
     }
 
     /// Run one frame of inference. Returns the per-band gains and the VAD probability.
@@ -197,6 +270,26 @@ impl FusorDense {
         apply_activation(&mut out, self.activation);
         Ok(out)
     }
+
+    async fn forward_batched_async(
+        &self,
+        device: &Device,
+        input: &[f32],
+        batch: usize,
+    ) -> fusor::Result<Vec<f32>> {
+        debug_assert_eq!(input.len(), self.n_in * batch);
+        let input_tensor: Tensor<2, f32> = Tensor::from_slice(device, [self.n_in, batch], input);
+        let mut out = matmul_readback(&self.weight, &input_tensor, self.n_out * batch).await?;
+        // Broadcast bias across batch.
+        for j in 0..self.n_out {
+            let b = self.bias[j];
+            for bi in 0..batch {
+                out[j * batch + bi] += b;
+            }
+        }
+        apply_activation(&mut out, self.activation);
+        Ok(out)
+    }
 }
 
 impl FusorGru {
@@ -264,6 +357,65 @@ impl FusorGru {
 
         self.finalize_step(state, &in_proj, &rec_zr, &rec_h);
         Ok(())
+    }
+
+    async fn step_batched_async(
+        &self,
+        device: &Device,
+        state: &mut [f32],
+        input: &[f32],
+        batch: usize,
+    ) -> fusor::Result<()> {
+        debug_assert_eq!(input.len(), self.n_in * batch);
+        debug_assert_eq!(state.len(), self.n_out * batch);
+        let n = self.n_out;
+
+        let input_tensor: Tensor<2, f32> =
+            Tensor::from_slice(device, [self.n_in, batch], input);
+        let state_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, batch], state);
+
+        let in_proj = matmul_readback(&self.w_in, &input_tensor, 3 * n * batch).await?;
+        let rec_zr = matmul_readback(&self.w_rec_zr, &state_tensor, 2 * n * batch).await?;
+
+        let mut gated_reset = vec![0.0f32; n * batch];
+        for j in 0..n {
+            for b in 0..batch {
+                let idx = j * batch + b;
+                let pre =
+                    self.bias[n + j] + in_proj[(n + j) * batch + b] + rec_zr[(n + j) * batch + b];
+                gated_reset[idx] = state[idx] * sigmoid(pre);
+            }
+        }
+        let gated_tensor: Tensor<2, f32> = Tensor::from_slice(device, [n, batch], &gated_reset);
+        let rec_h = matmul_readback(&self.w_rec_h, &gated_tensor, n * batch).await?;
+
+        self.finalize_batched_step(state, &in_proj, &rec_zr, &rec_h, batch);
+        Ok(())
+    }
+
+    fn finalize_batched_step(
+        &self,
+        state: &mut [f32],
+        in_proj: &[f32],
+        rec_zr: &[f32],
+        rec_h: &[f32],
+        batch: usize,
+    ) {
+        let n = self.n_out;
+        for j in 0..n {
+            for b in 0..batch {
+                let idx = j * batch + b;
+                let z = sigmoid(self.bias[j] + in_proj[j * batch + b] + rec_zr[j * batch + b]);
+                let pre =
+                    self.bias[2 * n + j] + in_proj[(2 * n + j) * batch + b] + rec_h[j * batch + b];
+                let h = match self.activation {
+                    Activation::Sigmoid => sigmoid(pre),
+                    Activation::Tanh => pre.tanh(),
+                    Activation::Relu => pre.max(0.0),
+                };
+                state[idx] = z * state[idx] + (1.0 - z) * h;
+            }
+        }
     }
 
     fn finalize_step(&self, state: &mut [f32], in_proj: &[f32], rec_zr: &[f32], rec_h: &[f32]) {
@@ -357,6 +509,43 @@ async fn matvec_async(
         out[j] = slice[[j, 0]];
     }
     Ok(out)
+}
+
+/// Run a matmul then read the entire flat result back as a `Vec<f32>`. Used by the batched path
+/// which already reads in row-major order.
+async fn matmul_readback(
+    weight: &Tensor<2, f32>,
+    rhs: &Tensor<2, f32>,
+    expected_len: usize,
+) -> fusor::Result<Vec<f32>> {
+    let result = weight.matmul(rhs);
+    let slice = result.as_slice().await?;
+    let raw = slice.as_slice();
+    debug_assert_eq!(raw.len(), expected_len);
+    Ok(raw.to_vec())
+}
+
+/// Concatenate three [d, batch] row-major buffers along the d-dimension into `dst`.
+fn concat_rows(dst: &mut [f32], a: &[f32], b: &[f32], c: &[f32], batch: usize) {
+    let na = a.len() / batch;
+    let nb = b.len() / batch;
+    let nc = c.len() / batch;
+    debug_assert_eq!(dst.len(), (na + nb + nc) * batch);
+    for j in 0..na {
+        let dst_row = j;
+        let row_off = dst_row * batch;
+        dst[row_off..row_off + batch].copy_from_slice(&a[j * batch..(j + 1) * batch]);
+    }
+    for j in 0..nb {
+        let dst_row = na + j;
+        let row_off = dst_row * batch;
+        dst[row_off..row_off + batch].copy_from_slice(&b[j * batch..(j + 1) * batch]);
+    }
+    for j in 0..nc {
+        let dst_row = na + nb + j;
+        let row_off = dst_row * batch;
+        dst[row_off..row_off + batch].copy_from_slice(&c[j * batch..(j + 1) * batch]);
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {

@@ -169,4 +169,29 @@ fn fusor_gpu_benchmark() {
         fusor_gpu_elapsed.as_secs_f64() / cpu_ref_elapsed.as_secs_f64(),
         fusor_gpu_elapsed.as_secs_f64() / fusor_cpu_elapsed.as_secs_f64(),
     );
+
+    // Batched GPU sweep.
+    eprintln!("\nbatched GPU (frames/sec across {} frames per batch):", n);
+    for &batch in &[1usize, 8, 32, 128, 512, 2048] {
+        let mut state = fusor_gpu.new_batched_state(batch);
+        let features_batched: Vec<f32> = (0..42 * batch)
+            .map(|i| (i as f32 * 0.01).sin() * 0.3)
+            .collect();
+        // warmup
+        let _ = block_on(fusor_gpu.forward_batched(&features_batched, &mut state)).unwrap();
+
+        let iters = 200usize.max(n / batch.max(1));
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = block_on(fusor_gpu.forward_batched(&features_batched, &mut state)).unwrap();
+        }
+        let elapsed = t0.elapsed();
+        let total_frames = iters * batch;
+        let frame_us = elapsed.as_micros() as f64 / total_frames as f64;
+        let call_us = elapsed.as_micros() as f64 / iters as f64;
+        eprintln!(
+            "  batch={:>4}  call={:>9.2} us  per-frame={:>8.3} us  ({} iters, {} total frames)",
+            batch, call_us, frame_us, iters, total_frames
+        );
+    }
 }
