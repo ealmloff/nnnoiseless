@@ -30,7 +30,7 @@ mod rnn;
 
 pub use denoise::DenoiseState;
 pub use features::DenoiseFeatures;
-pub use rnn::RnnModel;
+pub use rnn::{RnnModel, RnnState};
 #[cfg(feature = "fusor")]
 pub use fusor_rnn::{FusorRnnoise, FusorRnnoiseState};
 #[cfg(feature = "dasp")]

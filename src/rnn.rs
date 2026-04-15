@@ -61,6 +61,7 @@ pub struct RnnModel {
     pub(crate) vad_output: DenseLayer,
 }
 
+/// Mutable hidden state for the RNNoise denoising network.
 #[derive(Clone)]
 pub struct RnnState<'model> {
     model: Cow<'model, RnnModel>,
@@ -328,7 +329,8 @@ impl GruLayer {
 }
 
 impl<'model> RnnState<'model> {
-    pub(crate) fn new(model: Cow<'model, RnnModel>) -> RnnState<'model> {
+    /// Build a fresh RNN state for the given model.
+    pub fn new(model: Cow<'model, RnnModel>) -> RnnState<'model> {
         let vad_gru_state = vec![0.0f32; model.vad_gru.nb_neurons];
         let noise_gru_state = vec![0.0f32; model.noise_gru.nb_neurons];
         let denoise_gru_state = vec![0.0f32; model.denoise_gru.nb_neurons];
@@ -340,6 +342,7 @@ impl<'model> RnnState<'model> {
         }
     }
 
+    /// Run one frame of inference, writing per-band gains and the VAD output.
     pub fn compute(&mut self, gains: &mut [f32], vad: &mut [f32], input: &[f32]) {
         assert_eq!(input.len(), INPUT_SIZE);
 
