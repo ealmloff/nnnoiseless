@@ -32,7 +32,7 @@ pub struct FusorRnnoiseState {
 
 struct FusorDense {
     weight: Tensor<2, f32>,
-    bias: Tensor<1, f32>,
+    bias: Vec<f32>,
     activation: Activation,
     n_in: usize,
     n_out: usize,
@@ -41,8 +41,12 @@ struct FusorDense {
 struct FusorGru {
     /// Input-to-hidden weights for [z | r | h] gates, shape `[3 * n_out, n_in]`.
     w_in: Tensor<2, f32>,
-    /// Recurrent weights for [z | r | h] gates, shape `[3 * n_out, n_out]`.
-    w_rec: Tensor<2, f32>,
+    /// Recurrent weights for the z and r gates only, shape `[2 * n_out, n_out]`.
+    /// (The h gate's recurrent projection runs against the *gated* reset vector, so it has to be a
+    /// separate matmul — splitting it out lets us skip recomputing the wasted h-rows here.)
+    w_rec_zr: Tensor<2, f32>,
+    /// Recurrent weights for the h gate, shape `[n_out, n_out]`.
+    w_rec_h: Tensor<2, f32>,
     /// Concatenated biases [z | r | h], shape `[3 * n_out]`.
     bias: Vec<f32>,
     activation: Activation,
@@ -106,7 +110,7 @@ impl FusorDense {
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
         FusorDense {
             weight: Tensor::Cpu(fusor::CpuTensor::from_slice([layer.nb_neurons, layer.nb_inputs], &weight)),
-            bias: Tensor::Cpu(fusor::CpuTensor::from_slice([layer.nb_neurons], &bias)),
+            bias,
             activation: layer.activation,
             n_in: layer.nb_inputs,
             n_out: layer.nb_neurons,
@@ -118,7 +122,7 @@ impl FusorDense {
         let input_tensor: Tensor<2, f32> =
             Tensor::Cpu(fusor::CpuTensor::from_slice([self.n_in, 1], input));
         let mut out = matvec(&self.weight, &input_tensor, self.n_out);
-        for (out, &b) in out.iter_mut().zip(read_1d(&self.bias).iter()) {
+        for (out, &b) in out.iter_mut().zip(self.bias.iter()) {
             *out += b;
         }
         apply_activation(&mut out, self.activation);
@@ -130,11 +134,13 @@ impl FusorGru {
     fn from_layer(layer: &GruLayer) -> Self {
         let n = layer.nb_neurons;
         let in_w = transpose_gru_weights(&layer.input_weights, layer.nb_inputs, n);
-        let rec_w = transpose_gru_weights(&layer.recurrent_weights, n, n);
+        let rec_w_zr = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 0..2 * n);
+        let rec_w_h = transpose_gru_weights_partial(&layer.recurrent_weights, n, n, 2 * n..3 * n);
         let bias: Vec<f32> = layer.bias.iter().map(|&b| b as f32 * WEIGHTS_SCALE).collect();
         FusorGru {
             w_in: Tensor::Cpu(fusor::CpuTensor::from_slice([3 * n, layer.nb_inputs], &in_w)),
-            w_rec: Tensor::Cpu(fusor::CpuTensor::from_slice([3 * n, n], &rec_w)),
+            w_rec_zr: Tensor::Cpu(fusor::CpuTensor::from_slice([2 * n, n], &rec_w_zr)),
+            w_rec_h: Tensor::Cpu(fusor::CpuTensor::from_slice([n, n], &rec_w_h)),
             bias,
             activation: layer.activation,
             n_in: layer.nb_inputs,
@@ -152,30 +158,26 @@ impl FusorGru {
         let state_tensor: Tensor<2, f32> = Tensor::Cpu(fusor::CpuTensor::from_slice([n, 1], state));
 
         let in_proj = matvec(&self.w_in, &input_tensor, 3 * n);
-        let rec_proj = matvec(&self.w_rec, &state_tensor, 3 * n);
+        let rec_zr = matvec(&self.w_rec_zr, &state_tensor, 2 * n);
 
-        // Update gate z.
-        let mut z = vec![0.0f32; n];
-        for j in 0..n {
-            z[j] = sigmoid(self.bias[j] + in_proj[j] + rec_proj[j]);
-        }
-        // Reset gate, multiplied element-wise by the prior state (mirrors RnnState::compute).
+        // Reset gate gates the state, then a second recurrent matmul produces h's recurrent term.
         let mut gated_reset = vec![0.0f32; n];
         for j in 0..n {
-            gated_reset[j] = state[j] * sigmoid(self.bias[n + j] + in_proj[n + j] + rec_proj[n + j]);
+            gated_reset[j] = state[j] * sigmoid(self.bias[n + j] + in_proj[n + j] + rec_zr[n + j]);
         }
-        // Candidate state h: re-run the recurrent projection against the gated reset.
         let gated_tensor: Tensor<2, f32> =
             Tensor::Cpu(fusor::CpuTensor::from_slice([n, 1], &gated_reset));
-        let rec_h = matvec(&self.w_rec, &gated_tensor, 3 * n);
+        let rec_h = matvec(&self.w_rec_h, &gated_tensor, n);
+
         for j in 0..n {
-            let pre = self.bias[2 * n + j] + in_proj[2 * n + j] + rec_h[2 * n + j];
+            let z = sigmoid(self.bias[j] + in_proj[j] + rec_zr[j]);
+            let pre = self.bias[2 * n + j] + in_proj[2 * n + j] + rec_h[j];
             let h = match self.activation {
                 Activation::Sigmoid => sigmoid(pre),
                 Activation::Tanh => pre.tanh(),
                 Activation::Relu => pre.max(0.0),
             };
-            state[j] = z[j] * state[j] + (1.0 - z[j]) * h;
+            state[j] = z * state[j] + (1.0 - z) * h;
         }
     }
 }
@@ -187,6 +189,28 @@ fn transpose_dense_weights(data: &[i8], n_in: usize, n_out: usize) -> Vec<f32> {
     for i in 0..n_in {
         for j in 0..n_out {
             out[j * n_in + i] = data[i * n_out + j] as f32 * WEIGHTS_SCALE;
+        }
+    }
+    out
+}
+
+fn transpose_gru_weights_partial(
+    data: &[i8],
+    n_in: usize,
+    n_out: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f32> {
+    // Pull out a contiguous row range from the [3n, n_in] target layout. `rows` is in target-row
+    // coordinates (0..3n).
+    let stride = 3 * n_out;
+    let row_count = rows.end - rows.start;
+    let mut out = vec![0.0f32; row_count * n_in];
+    for (target_row_idx, target_row) in rows.enumerate() {
+        let gate = target_row / n_out;
+        let j = target_row % n_out;
+        for i in 0..n_in {
+            let src = i * stride + gate * n_out + j;
+            out[target_row_idx * n_in + i] = data[src] as f32 * WEIGHTS_SCALE;
         }
     }
     out
@@ -217,21 +241,9 @@ fn matvec(weight: &Tensor<2, f32>, input_2d: &Tensor<2, f32>, n_out: usize) -> V
         _ => panic!("FusorRnnoise expects CPU tensors"),
     };
     let slice = cpu.as_slice();
-    let mut out = vec![0.0f32; n_out];
-    for j in 0..n_out {
-        out[j] = slice[[j, 0]];
-    }
-    out
-}
-
-fn read_1d(t: &Tensor<1, f32>) -> Vec<f32> {
-    let cpu = match t {
-        Tensor::Cpu(t) => t.clone(),
-        _ => panic!("FusorRnnoise expects CPU tensors"),
-    };
-    let slice = cpu.as_slice();
-    let n = slice.shape()[0];
-    (0..n).map(|i| slice[[i]]).collect()
+    let raw = slice.as_slice();
+    debug_assert_eq!(raw.len(), n_out);
+    raw.to_vec()
 }
 
 fn sigmoid(x: f32) -> f32 {
